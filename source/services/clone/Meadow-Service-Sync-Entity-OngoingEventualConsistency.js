@@ -139,9 +139,29 @@ class MeadowSyncEntityOngoingEventualConsistency extends libMeadowSyncEntityOngo
 	}
 
 	// Override deleted record sync with a time-budgeted version.
-	// The base syncDeletedRecords() walks ALL deleted records on the server
-	// with no limit, which defeats the purpose of eventual consistency.
-	// This version processes pages until BackSyncTimeLimit is exhausted.
+	//
+	// The server does not return deleted rows through the normal endpoints, so
+	// we page the deleted set explicitly and flag the matching LOCAL row deleted.
+	//
+	// SAFETY — match on IDENTITY, never on GUID.  This is a database clone: the
+	// identity column is authoritative and equals the origin's (joins and FKs
+	// depend on it), while GUIDs are NOT guaranteed unique in this data.  Acting
+	// on a GUID match could soft-delete the WRONG row (a different, possibly
+	// active, record that happens to share the GUID).  So we read and delete only
+	// by the row whose id equals the server's deleted row's id.
+	//
+	// A deleted server row whose id is not present locally was deleted before it
+	// was ever cloned here.  We do NOT create it: with duplicate GUIDs a create
+	// collides on the GUID unique index (the old "...already exists!" log storm),
+	// and backfilling those rows + de-duplicating GUIDs is a separate cleanup.
+	// We count them so the remaining backlog is visible.
+	//
+	// Ordering: newest-first by the indexed identity column.  Sorting by
+	// DeleteDate is honored by the API but is an unindexed filesort (10-150x
+	// slower on large tables — Observation: 87s for one page), so we order by the
+	// PK and stay within budget.  DeleteDate is present in the payload, so a
+	// future steady-state cursor can track the server's delete high-water mark
+	// without paying for the sort.  Processing is time-budgeted to BackSyncTimeLimit.
 	syncDeletedRecords(fCallback)
 	{
 		const tmpDeletedColumn = this.EntitySchema.Columns.find((c) => c.Column == 'Deleted');
@@ -151,7 +171,7 @@ class MeadowSyncEntityOngoingEventualConsistency extends libMeadowSyncEntityOngo
 			return fCallback();
 		}
 
-		this.fable.log.info(`Checking for deleted records on server for ${this.EntitySchema.TableName} (time-budgeted)...`);
+		this.fable.log.info(`Checking for deleted records on server for ${this.EntitySchema.TableName} (time-budgeted, matching on ${this.DefaultIdentifier})...`);
 
 		this.fable.MeadowCloneRestClient.getJSON(this._appendDeletedQueryString(`${this.EntitySchema.TableName}s/Count/FilteredTo/FBV~Deleted~EQ~1`),
 			(pError, pResponse, pBody) =>
@@ -169,122 +189,136 @@ class MeadowSyncEntityOngoingEventualConsistency extends libMeadowSyncEntityOngo
 					return fCallback();
 				}
 
-				this.fable.log.info(`Found ${tmpDeletedCount} deleted records on server for ${this.EntitySchema.TableName}; syncing deletions with ${this.BackSyncTimeLimit}ms budget...`);
-
-				let tmpDeleteCap = (this.MaxRecordsPerEntity > 0)
+				const tmpDeleteCap = (this.MaxRecordsPerEntity > 0)
 					? Math.min(tmpDeletedCount, this.MaxRecordsPerEntity)
 					: tmpDeletedCount;
 
+				this.fable.log.info(`Found ${tmpDeletedCount} deleted records on server for ${this.EntitySchema.TableName}; reconciling newest-first with ${this.BackSyncTimeLimit}ms budget...`);
+
 				const tmpStartTime = Date.now();
-				let tmpProcessed = 0;
 				let tmpOffset = 0;
+				let tmpSeen = 0;       // server rows examined
+				let tmpMarked = 0;     // local rows (matched by id) newly flagged deleted
+				let tmpAlready = 0;    // local rows already deleted
+				let tmpNotInClone = 0; // deleted id not present locally (backlog — needs backfill cleanup)
+				let tmpErrors = 0;     // read/delete failures
+
+				const fFinish = (pReason) =>
+				{
+					const tmpElapsed = Date.now() - tmpStartTime;
+					// Surface the real delete count in the structured run report
+					// (it was previously hard-coded to 0).
+					if (this.syncResults)
+					{
+						this.syncResults.Deleted = tmpMarked;
+					}
+					this.fable.log.info(`Delete sync ${pReason} for ${this.EntitySchema.TableName} after ${tmpElapsed}ms: marked ${tmpMarked}, already-deleted ${tmpAlready}, not-in-clone ${tmpNotInClone}, errors ${tmpErrors} (examined ${tmpSeen} of ${tmpDeletedCount}).`);
+					return fCallback();
+				};
 
 				// Fetch deleted record pages one at a time using a recursive
-				// fetcher instead of pre-generating all URL partials.  With
-				// millions of deleted records and a short time budget, the old
-				// eachLimit approach generated hundreds of thousands of partials
-				// and then had to skip them all when the budget expired.
+				// fetcher.  Newest-first by the indexed identity column so recent
+				// deletions are reconciled within budget even when the historical
+				// backlog is large.
 				const fFetchDeletedPage = () =>
 				{
-					// Time budget check — stop immediately
 					if (Date.now() - tmpStartTime >= this.BackSyncTimeLimit)
 					{
-						const tmpElapsed = Date.now() - tmpStartTime;
-						this.fable.log.info(`Delete sync time budget exhausted for ${this.EntitySchema.TableName} after ${tmpElapsed}ms (${tmpProcessed} of ${tmpDeletedCount} deleted records processed).`);
-						return fCallback();
+						return fFinish('time budget exhausted');
 					}
-
-					// All pages processed
 					if (tmpOffset >= tmpDeleteCap)
 					{
-						const tmpElapsed = Date.now() - tmpStartTime;
-						this.fable.log.info(`Delete sync complete for ${this.EntitySchema.TableName} (${tmpProcessed} of ${tmpDeletedCount} deleted records processed in ${tmpElapsed}ms).`);
-						return fCallback();
+						return fFinish('complete');
 					}
 
-					const tmpURL = this._appendDeletedQueryString(`${this.EntitySchema.TableName}s/FilteredTo/FBV~Deleted~EQ~1~FSF~${this.DefaultIdentifier}~ASC~ASC/${tmpOffset}/${this.PageSize}`);
+					const tmpURL = this._appendDeletedQueryString(`${this.EntitySchema.TableName}s/FilteredTo/FBV~Deleted~EQ~1~FSF~${this.DefaultIdentifier}~DESC~DESC/${tmpOffset}/${this.PageSize}`);
 					tmpOffset += this.PageSize;
 
 					this.fable.MeadowCloneRestClient.getJSON(tmpURL,
-						(pDownloadError, pResponse, pBody) =>
+						(pDownloadError, pResponse, pPageBody) =>
 						{
-							if (pDownloadError || !pBody || !Array.isArray(pBody) || pBody.length < 1)
+							if (pDownloadError || !pPageBody || !Array.isArray(pPageBody) || pPageBody.length < 1)
 							{
-								// Empty page or error — we've reached the end
-								const tmpElapsed = Date.now() - tmpStartTime;
-								this.fable.log.info(`Delete sync complete for ${this.EntitySchema.TableName} (${tmpProcessed} of ${tmpDeletedCount} deleted records processed in ${tmpElapsed}ms).`);
-								return fCallback();
+								return fFinish('complete');
 							}
 
-							this.fable.Utility.eachLimit(pBody, 5,
+							this.fable.Utility.eachLimit(pPageBody, 5,
 								(pEntityRecord, fRecordComplete) =>
 								{
+									tmpSeen++;
+
 									const tmpRecordID = pEntityRecord[this.DefaultIdentifier];
-									if (!tmpRecordID || tmpRecordID < 1)
+									if (tmpRecordID === undefined || tmpRecordID === null || tmpRecordID < 1)
 									{
+										tmpNotInClone++;
 										return setImmediate(fRecordComplete);
 									}
 
+									// Read by IDENTITY only (the authoritative, unique key).  We
+									// never look up or act on the GUID — see the SAFETY note above.
 									const tmpQuery = this.Meadow.query;
 									tmpQuery.addFilter(this.DefaultIdentifier, tmpRecordID);
 									tmpQuery.setDisableDeleteTracking(true);
 
 									this.Meadow.doRead(tmpQuery,
-										(pReadError, pQuery, pRecord) =>
+										(pReadError, pReadQuery, pLocalRecord) =>
 										{
-											if (pReadError || !pRecord)
+											if (pReadError)
 											{
-												const tmpRecordToCommit = this.marshalRecord(pEntityRecord);
-
-												const tmpCreateQuery = this.Meadow.query.addRecord(tmpRecordToCommit);
-												tmpCreateQuery.setDisableAutoIdentity(true);
-												tmpCreateQuery.setDisableAutoDateStamp(true);
-												tmpCreateQuery.setDisableAutoUserStamp(true);
-												tmpCreateQuery.setDisableDeleteTracking(true);
-												tmpCreateQuery.AllowIdentityInsert = true;
-
-												this.Meadow.doCreate(tmpCreateQuery,
-													(pCreateError) =>
-													{
-														if (pCreateError)
-														{
-															this.log.error(`Error creating deleted record ${this.EntitySchema.TableName} ID ${tmpRecordID}: ${pCreateError}`);
-														}
-														tmpProcessed++;
-														return setImmediate(fRecordComplete);
-													});
-												return;
-											}
-
-											if (pRecord.Deleted == 1)
-											{
-												tmpProcessed++;
+												tmpErrors++;
+												this.log.error(`Delete sync read error for ${this.EntitySchema.TableName} ${this.DefaultIdentifier}=${tmpRecordID}: ${pReadError}`);
 												return setImmediate(fRecordComplete);
 											}
 
-											const tmpRecordToCommit = this.marshalRecord(pEntityRecord);
+											// Deleted id not in the clone — deleted before it was ever
+											// synced here.  Do NOT create (collides on duplicate GUIDs);
+											// leave it for the backfill/de-dup cleanup.
+											if (!pLocalRecord)
+											{
+												tmpNotInClone++;
+												return setImmediate(fRecordComplete);
+											}
 
-											const tmpUpdateQuery = this.Meadow.query.addRecord(tmpRecordToCommit);
-											tmpUpdateQuery.setDisableAutoIdentity(true);
-											tmpUpdateQuery.setDisableAutoDateStamp(true);
-											tmpUpdateQuery.setDisableAutoUserStamp(true);
-											tmpUpdateQuery.setDisableDeleteTracking(true);
+											// Already reconciled — cheap skip.
+											if (pLocalRecord.Deleted == 1)
+											{
+												tmpAlready++;
+												return setImmediate(fRecordComplete);
+											}
 
-											this.Meadow.doUpdate(tmpUpdateQuery,
-												(pUpdateError) =>
+											// Flag THIS row — selected by its authoritative, unique id,
+											// so we can never touch a different record that shares the
+											// GUID.  doDelete is the canonical soft-delete (UPDATE ... SET
+											// Deleted=1, DeleteDate=NOW(), DeletingIDUser=... WHERE id=?
+											// AND Deleted=0): idempotent, and — unlike doUpdate — it
+											// neither strips the delete-tracking columns nor trips the
+											// delete-tracking-filtered post-update verify read.  DeleteDate
+											// is stamped to the local detection time (meadow has no path
+											// to set the source's value); adequate for the clone.
+											const tmpDeleteQuery = this.Meadow.query;
+											tmpDeleteQuery.addFilter(this.DefaultIdentifier, tmpRecordID);
+
+											this.Meadow.doDelete(tmpDeleteQuery,
+												(pDeleteError) =>
 												{
-													if (pUpdateError)
+													if (pDeleteError)
 													{
-														this.log.error(`Error marking record as deleted ${this.EntitySchema.TableName} ID ${tmpRecordID}: ${pUpdateError}`);
+														tmpErrors++;
+														this.log.error(`Error marking record deleted ${this.EntitySchema.TableName} ${this.DefaultIdentifier}=${tmpRecordID}: ${pDeleteError}`);
 													}
-													tmpProcessed++;
+													else
+													{
+														tmpMarked++;
+													}
 													return setImmediate(fRecordComplete);
 												});
 										});
 								},
 								(pRecordSyncError) =>
 								{
-									// Page complete — fetch next page
+									// Page complete — heartbeat, then fetch next page.
+									const tmpElapsed = Date.now() - tmpStartTime;
+									this.fable.log.info(`Delete sync ${this.EntitySchema.TableName}: examined ${tmpSeen}/${tmpDeletedCount} — marked ${tmpMarked}, already ${tmpAlready}, not-in-clone ${tmpNotInClone}, errors ${tmpErrors} (${tmpElapsed}ms).`);
 									return setImmediate(fFetchDeletedPage);
 								});
 						});
