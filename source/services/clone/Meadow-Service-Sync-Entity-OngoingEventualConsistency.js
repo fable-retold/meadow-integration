@@ -1,4 +1,5 @@
 const libMeadowSyncEntityOngoing = require('./Meadow-Service-Sync-Entity-Ongoing.js');
+const libMeadowDeleteCursorStore = require('./Meadow-Service-DeleteCursorStore.js');
 
 class MeadowSyncEntityOngoingEventualConsistency extends libMeadowSyncEntityOngoing
 {
@@ -13,6 +14,19 @@ class MeadowSyncEntityOngoingEventualConsistency extends libMeadowSyncEntityOngo
 		this.BackSyncTimeLimit = (typeof(this.options.BackSyncTimeLimit) === 'number')
 			? this.options.BackSyncTimeLimit
 			: 30000;
+
+		// Optional resumable-delete cursor.  When a state-file path is configured
+		// (via options or fable settings), delete reconciliation persists how far
+		// it has progressed so each run resumes instead of re-walking from the top.
+		// Unset → disabled, and delete sync behaves exactly as the non-cursor path.
+		// The file must live on a path that survives between runs to be useful.
+		const tmpSettings = this.fable.settings || {};
+		this.DeleteCursorStatePath = this.options.DeleteCursorStatePath || tmpSettings.DeleteCursorStatePath || '';
+		// Hours between full re-sweeps once caught up (catches deletions of older
+		// records that landed in already-swept id ranges).  Default 1 week.
+		this.DeleteResweepIntervalHours = (typeof(this.options.DeleteResweepIntervalHours) === 'number')
+			? this.options.DeleteResweepIntervalHours
+			: (typeof(tmpSettings.DeleteResweepIntervalHours) === 'number') ? tmpSettings.DeleteResweepIntervalHours : 168;
 	}
 
 	// Bisect an ID range with a time budget.  Checks the budget at the start of
@@ -171,6 +185,14 @@ class MeadowSyncEntityOngoingEventualConsistency extends libMeadowSyncEntityOngo
 			return fCallback();
 		}
 
+		// Opt-in resumable cursor: when a state-file path is configured, persist
+		// how far reconciliation has progressed so each run resumes instead of
+		// re-walking from the newest record every time.  Unset → this exact path.
+		if (this.DeleteCursorStatePath)
+		{
+			return this._syncDeletedRecordsWithCursor(fCallback);
+		}
+
 		this.fable.log.info(`Checking for deleted records on server for ${this.EntitySchema.TableName} (time-budgeted, matching on ${this.DefaultIdentifier})...`);
 
 		this.fable.MeadowCloneRestClient.getJSON(this._appendDeletedQueryString(`${this.EntitySchema.TableName}s/Count/FilteredTo/FBV~Deleted~EQ~1`),
@@ -197,11 +219,7 @@ class MeadowSyncEntityOngoingEventualConsistency extends libMeadowSyncEntityOngo
 
 				const tmpStartTime = Date.now();
 				let tmpOffset = 0;
-				let tmpSeen = 0;       // server rows examined
-				let tmpMarked = 0;     // local rows (matched by id) newly flagged deleted
-				let tmpAlready = 0;    // local rows already deleted
-				let tmpNotInClone = 0; // deleted id not present locally (backlog — needs backfill cleanup)
-				let tmpErrors = 0;     // read/delete failures
+				const tmpCounters = { seen: 0, marked: 0, already: 0, notInClone: 0, errors: 0 };
 
 				const fFinish = (pReason) =>
 				{
@@ -210,9 +228,9 @@ class MeadowSyncEntityOngoingEventualConsistency extends libMeadowSyncEntityOngo
 					// (it was previously hard-coded to 0).
 					if (this.syncResults)
 					{
-						this.syncResults.Deleted = tmpMarked;
+						this.syncResults.Deleted = tmpCounters.marked;
 					}
-					this.fable.log.info(`Delete sync ${pReason} for ${this.EntitySchema.TableName} after ${tmpElapsed}ms: marked ${tmpMarked}, already-deleted ${tmpAlready}, not-in-clone ${tmpNotInClone}, errors ${tmpErrors} (examined ${tmpSeen} of ${tmpDeletedCount}).`);
+					this.fable.log.info(`Delete sync ${pReason} for ${this.EntitySchema.TableName} after ${tmpElapsed}ms: marked ${tmpCounters.marked}, already-deleted ${tmpCounters.already}, not-in-clone ${tmpCounters.notInClone}, errors ${tmpCounters.errors} (examined ${tmpCounters.seen} of ${tmpDeletedCount}).`);
 					return fCallback();
 				};
 
@@ -245,80 +263,14 @@ class MeadowSyncEntityOngoingEventualConsistency extends libMeadowSyncEntityOngo
 							this.fable.Utility.eachLimit(pPageBody, 5,
 								(pEntityRecord, fRecordComplete) =>
 								{
-									tmpSeen++;
-
-									const tmpRecordID = pEntityRecord[this.DefaultIdentifier];
-									if (tmpRecordID === undefined || tmpRecordID === null || tmpRecordID < 1)
-									{
-										tmpNotInClone++;
-										return setImmediate(fRecordComplete);
-									}
-
-									// Read by IDENTITY only (the authoritative, unique key).  We
-									// never look up or act on the GUID — see the SAFETY note above.
-									const tmpQuery = this.Meadow.query;
-									tmpQuery.addFilter(this.DefaultIdentifier, tmpRecordID);
-									tmpQuery.setDisableDeleteTracking(true);
-
-									this.Meadow.doRead(tmpQuery,
-										(pReadError, pReadQuery, pLocalRecord) =>
-										{
-											if (pReadError)
-											{
-												tmpErrors++;
-												this.log.error(`Delete sync read error for ${this.EntitySchema.TableName} ${this.DefaultIdentifier}=${tmpRecordID}: ${pReadError}`);
-												return setImmediate(fRecordComplete);
-											}
-
-											// Deleted id not in the clone — deleted before it was ever
-											// synced here.  Do NOT create (collides on duplicate GUIDs);
-											// leave it for the backfill/de-dup cleanup.
-											if (!pLocalRecord)
-											{
-												tmpNotInClone++;
-												return setImmediate(fRecordComplete);
-											}
-
-											// Already reconciled — cheap skip.
-											if (pLocalRecord.Deleted == 1)
-											{
-												tmpAlready++;
-												return setImmediate(fRecordComplete);
-											}
-
-											// Flag THIS row — selected by its authoritative, unique id,
-											// so we can never touch a different record that shares the
-											// GUID.  doDelete is the canonical soft-delete (UPDATE ... SET
-											// Deleted=1, DeleteDate=NOW(), DeletingIDUser=... WHERE id=?
-											// AND Deleted=0): idempotent, and — unlike doUpdate — it
-											// neither strips the delete-tracking columns nor trips the
-											// delete-tracking-filtered post-update verify read.  DeleteDate
-											// is stamped to the local detection time (meadow has no path
-											// to set the source's value); adequate for the clone.
-											const tmpDeleteQuery = this.Meadow.query;
-											tmpDeleteQuery.addFilter(this.DefaultIdentifier, tmpRecordID);
-
-											this.Meadow.doDelete(tmpDeleteQuery,
-												(pDeleteError) =>
-												{
-													if (pDeleteError)
-													{
-														tmpErrors++;
-														this.log.error(`Error marking record deleted ${this.EntitySchema.TableName} ${this.DefaultIdentifier}=${tmpRecordID}: ${pDeleteError}`);
-													}
-													else
-													{
-														tmpMarked++;
-													}
-													return setImmediate(fRecordComplete);
-												});
-										});
+									tmpCounters.seen++;
+									this._reconcileDeletedRecordByID(pEntityRecord, tmpCounters, fRecordComplete);
 								},
 								(pRecordSyncError) =>
 								{
 									// Page complete — heartbeat, then fetch next page.
 									const tmpElapsed = Date.now() - tmpStartTime;
-									this.fable.log.info(`Delete sync ${this.EntitySchema.TableName}: examined ${tmpSeen}/${tmpDeletedCount} — marked ${tmpMarked}, already ${tmpAlready}, not-in-clone ${tmpNotInClone}, errors ${tmpErrors} (${tmpElapsed}ms).`);
+									this.fable.log.info(`Delete sync ${this.EntitySchema.TableName}: examined ${tmpCounters.seen}/${tmpDeletedCount} — marked ${tmpCounters.marked}, already ${tmpCounters.already}, not-in-clone ${tmpCounters.notInClone}, errors ${tmpCounters.errors} (${tmpElapsed}ms).`);
 									return setImmediate(fFetchDeletedPage);
 								});
 						});
@@ -326,6 +278,255 @@ class MeadowSyncEntityOngoingEventualConsistency extends libMeadowSyncEntityOngo
 
 				fFetchDeletedPage();
 			});
+	}
+
+	// Reconcile one server-deleted record into the clone, matched by IDENTITY
+	// ONLY (never GUID — see the SAFETY note on syncDeletedRecords).  Increments
+	// exactly one counter on pCounters: marked / already / notInClone / errors.
+	// Shared by both the time-budgeted path and the resumable-cursor path.
+	_reconcileDeletedRecordByID(pEntityRecord, pCounters, fDone)
+	{
+		const tmpRecordID = pEntityRecord[this.DefaultIdentifier];
+		if (tmpRecordID === undefined || tmpRecordID === null || tmpRecordID < 1)
+		{
+			pCounters.notInClone++;
+			return setImmediate(fDone);
+		}
+
+		// Read by the authoritative, unique identity column.  Delete tracking is
+		// disabled on the read so an already-deleted local row is still found
+		// (and skipped) rather than re-attempted.
+		const tmpQuery = this.Meadow.query;
+		tmpQuery.addFilter(this.DefaultIdentifier, tmpRecordID);
+		tmpQuery.setDisableDeleteTracking(true);
+
+		this.Meadow.doRead(tmpQuery,
+			(pReadError, pReadQuery, pLocalRecord) =>
+			{
+				if (pReadError)
+				{
+					pCounters.errors++;
+					this.log.error(`Delete sync read error for ${this.EntitySchema.TableName} ${this.DefaultIdentifier}=${tmpRecordID}: ${pReadError}`);
+					return setImmediate(fDone);
+				}
+
+				// Deleted id not in the clone — deleted before it was ever synced
+				// here.  Do NOT create (collides on duplicate GUIDs); leave it for
+				// the backfill/de-dup cleanup.
+				if (!pLocalRecord)
+				{
+					pCounters.notInClone++;
+					return setImmediate(fDone);
+				}
+
+				// Already reconciled — cheap skip.
+				if (pLocalRecord.Deleted == 1)
+				{
+					pCounters.already++;
+					return setImmediate(fDone);
+				}
+
+				// Flag THIS row — selected by its authoritative, unique id, so we
+				// can never touch a different record that shares the GUID.  doDelete
+				// is the canonical soft-delete (UPDATE ... SET Deleted=1,
+				// DeleteDate=NOW(), DeletingIDUser=... WHERE id=? AND Deleted=0):
+				// idempotent, and — unlike doUpdate — it neither strips the
+				// delete-tracking columns nor trips the delete-tracking-filtered
+				// post-update verify read.  DeleteDate is the local detection time
+				// (meadow has no path to set the source's value); fine for the clone.
+				const tmpDeleteQuery = this.Meadow.query;
+				tmpDeleteQuery.addFilter(this.DefaultIdentifier, tmpRecordID);
+
+				this.Meadow.doDelete(tmpDeleteQuery,
+					(pDeleteError) =>
+					{
+						if (pDeleteError)
+						{
+							pCounters.errors++;
+							this.log.error(`Error marking record deleted ${this.EntitySchema.TableName} ${this.DefaultIdentifier}=${tmpRecordID}: ${pDeleteError}`);
+						}
+						else
+						{
+							pCounters.marked++;
+						}
+						return setImmediate(fDone);
+					});
+			});
+	}
+
+	// Resumable delete reconciliation (opt-in via DeleteCursorStatePath).
+	//
+	// Persists two id marks per table in a small JSON file so a run resumes
+	// rather than re-walking from the newest record (which, with heavy rows and a
+	// time budget, never reaches the older backlog):
+	//   - HeadID: highest deleted id already covered from the top.
+	//   - TailID: resume point of the downward catch-up sweep.
+	// Each run does a HEAD pass (id > HeadID — new deletions since last run, cheap)
+	// then a TAIL pass (id < TailID — drain older backlog within the remaining
+	// budget).  When the tail reaches the bottom, the backlog is drained and only
+	// the head pass runs thereafter.  A periodic re-sweep (DeleteResweepIntervalHours)
+	// resets the tail to catch deletions that landed in already-swept id ranges.
+	// All keyset paging (id < cursor) — no growing OFFSET scan.
+	//
+	// Safety/behavior is identical to the non-cursor path (same id-only
+	// _reconcileDeletedRecordByID); only WHERE paging starts differs.  Missing or
+	// unreadable state degrades to a full sweep.
+	_syncDeletedRecordsWithCursor(fCallback)
+	{
+		const tmpTable = this.EntitySchema.TableName;
+		const tmpStore = new libMeadowDeleteCursorStore(this.DeleteCursorStatePath, this.fable.log);
+		const tmpState = tmpStore.get(tmpTable) || { HeadID: 0, TailID: null, CaughtUp: false, LastSweepEpoch: 0 };
+
+		// Re-sweep: once caught up, periodically reset the tail to re-drain from
+		// the top so deletions that landed in already-swept ranges are caught.
+		const tmpNow = Date.now();
+		if (tmpState.CaughtUp && this.DeleteResweepIntervalHours > 0
+			&& (tmpNow - (tmpState.LastSweepEpoch || 0)) >= (this.DeleteResweepIntervalHours * 3600000))
+		{
+			this.fable.log.info(`Delete cursor for ${tmpTable}: re-sweep interval elapsed; resetting tail to re-drain from the top.`);
+			tmpState.TailID = null;
+			tmpState.CaughtUp = false;
+		}
+
+		this.fable.log.info(`Delete cursor for ${tmpTable}: headID=${tmpState.HeadID}, tailID=${tmpState.TailID === null ? 'top' : tmpState.TailID}, caughtUp=${tmpState.CaughtUp} (matching on ${this.DefaultIdentifier}, ${this.BackSyncTimeLimit}ms budget)...`);
+
+		const tmpStartTime = Date.now();
+		const tmpCounters = { seen: 0, marked: 0, already: 0, notInClone: 0, errors: 0 };
+		let tmpNewHeadID = tmpState.HeadID;
+
+		const fSaveAndFinish = (pReason) =>
+		{
+			tmpState.HeadID = tmpNewHeadID;
+			tmpStore.set(tmpTable, tmpState);
+			const tmpElapsed = Date.now() - tmpStartTime;
+			if (this.syncResults)
+			{
+				this.syncResults.Deleted = tmpCounters.marked;
+			}
+			this.fable.log.info(`Delete cursor ${pReason} for ${tmpTable} after ${tmpElapsed}ms: marked ${tmpCounters.marked}, already ${tmpCounters.already}, not-in-clone ${tmpCounters.notInClone}, errors ${tmpCounters.errors} (examined ${tmpCounters.seen}); headID=${tmpState.HeadID}, tailID=${tmpState.TailID === null ? 'top' : tmpState.TailID}, caughtUp=${tmpState.CaughtUp}.`);
+			return fCallback();
+		};
+
+		// HEAD pass — only once a head has been established (not the first run).
+		const fRunHeadPass = (fHeadDone) =>
+		{
+			if (!(tmpState.HeadID > 0))
+			{
+				return fHeadDone();
+			}
+			this._fetchDeletedKeysetPass({ floorID: tmpState.HeadID, ceilID: null, startTime: tmpStartTime, counters: tmpCounters, label: 'head' },
+				(pResult) =>
+				{
+					if (pResult.maxID !== null && pResult.maxID > tmpNewHeadID) { tmpNewHeadID = pResult.maxID; }
+					return fHeadDone();
+				});
+		};
+
+		// TAIL pass — drain downward from TailID (null = from the very top, which
+		// is the first run and also establishes the head).
+		const fRunTailPass = (fTailDone) =>
+		{
+			if (tmpState.CaughtUp)
+			{
+				return fTailDone();
+			}
+			this._fetchDeletedKeysetPass({ floorID: null, ceilID: tmpState.TailID, startTime: tmpStartTime, counters: tmpCounters, label: 'tail' },
+				(pResult) =>
+				{
+					if (pResult.maxID !== null && pResult.maxID > tmpNewHeadID) { tmpNewHeadID = pResult.maxID; }
+					if (pResult.minID !== null) { tmpState.TailID = pResult.minID; }
+					if (pResult.reachedEnd)
+					{
+						tmpState.CaughtUp = true;
+						tmpState.LastSweepEpoch = Date.now();
+					}
+					return fTailDone();
+				});
+		};
+
+		fRunHeadPass(() =>
+		{
+			fRunTailPass(() =>
+			{
+				return fSaveAndFinish(tmpState.CaughtUp ? 'caught up (steady state)' : 'progressed');
+			});
+		});
+	}
+
+	// Keyset-paged pass over the deleted set: Deleted=1 [AND id > floorID]
+	// [AND id < ceilID], ordered id DESC, advancing the ceiling to each page's
+	// lowest id.  Shares the run's time budget (BackSyncTimeLimit) and the global
+	// MaxRecordsPerEntity cap.  Calls fComplete({ maxID, minID, reachedEnd }):
+	// maxID = highest id seen (first row, establishes head on the first run),
+	// minID = lowest id seen (next resume point), reachedEnd = the deleted set was
+	// exhausted within this pass.
+	_fetchDeletedKeysetPass(pOptions, fComplete)
+	{
+		const tmpFloorID = (pOptions.floorID === undefined) ? null : pOptions.floorID;
+		let tmpCeilID = (pOptions.ceilID === undefined) ? null : pOptions.ceilID;
+		const tmpCounters = pOptions.counters;
+		let tmpMaxID = null;
+		let tmpMinID = null;
+
+		const fFetch = () =>
+		{
+			if (Date.now() - pOptions.startTime >= this.BackSyncTimeLimit)
+			{
+				return fComplete({ maxID: tmpMaxID, minID: tmpMinID, reachedEnd: false });
+			}
+			if (this.MaxRecordsPerEntity > 0 && tmpCounters.seen >= this.MaxRecordsPerEntity)
+			{
+				return fComplete({ maxID: tmpMaxID, minID: tmpMinID, reachedEnd: false });
+			}
+
+			let tmpFilter = 'FBV~Deleted~EQ~1';
+			if (tmpFloorID !== null) { tmpFilter += `~FBV~${this.DefaultIdentifier}~GT~${tmpFloorID}`; }
+			if (tmpCeilID !== null) { tmpFilter += `~FBV~${this.DefaultIdentifier}~LT~${tmpCeilID}`; }
+			tmpFilter += `~FSF~${this.DefaultIdentifier}~DESC~DESC`;
+			const tmpURL = this._appendDeletedQueryString(`${this.EntitySchema.TableName}s/FilteredTo/${tmpFilter}/0/${this.PageSize}`);
+
+			this.fable.MeadowCloneRestClient.getJSON(tmpURL,
+				(pError, pResponse, pPageBody) =>
+				{
+					if (pError)
+					{
+						this.fable.log.warn(`Delete cursor ${this.EntitySchema.TableName} [${pOptions.label}]: page fetch error (${pError}); pausing pass.`);
+						return fComplete({ maxID: tmpMaxID, minID: tmpMinID, reachedEnd: false });
+					}
+					if (!Array.isArray(pPageBody) || pPageBody.length < 1)
+					{
+						// Empty page = exhausted this id range.
+						return fComplete({ maxID: tmpMaxID, minID: tmpMinID, reachedEnd: true });
+					}
+
+					if (tmpMaxID === null)
+					{
+						tmpMaxID = pPageBody[0][this.DefaultIdentifier]; // DESC → first row is the highest id
+					}
+
+					this.fable.Utility.eachLimit(pPageBody, 5,
+						(pEntityRecord, fRecordComplete) =>
+						{
+							tmpCounters.seen++;
+							this._reconcileDeletedRecordByID(pEntityRecord, tmpCounters, fRecordComplete);
+						},
+						(pRecordSyncError) =>
+						{
+							const tmpPageMinID = pPageBody[pPageBody.length - 1][this.DefaultIdentifier];
+							tmpMinID = tmpPageMinID;
+							tmpCeilID = tmpPageMinID; // keyset: next page is strictly below this page's lowest id
+							const tmpElapsed = Date.now() - pOptions.startTime;
+							this.fable.log.info(`Delete cursor ${this.EntitySchema.TableName} [${pOptions.label}]: examined ${tmpCounters.seen} — marked ${tmpCounters.marked}, already ${tmpCounters.already}, not-in-clone ${tmpCounters.notInClone}, errors ${tmpCounters.errors}; at id ${tmpPageMinID} (${tmpElapsed}ms).`);
+							if (pPageBody.length < this.PageSize)
+							{
+								return fComplete({ maxID: tmpMaxID, minID: tmpMinID, reachedEnd: true });
+							}
+							return setImmediate(fFetch);
+						});
+				});
+		};
+
+		fFetch();
 	}
 
 	_syncInternal(fCallback)

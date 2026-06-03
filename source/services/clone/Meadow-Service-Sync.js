@@ -184,6 +184,8 @@ class MeadowSync extends libFableServiceProviderBase
 						UseAdvancedIDPagination: this.UseAdvancedIDPagination,
 						BackSyncTimeLimit: this.BackSyncTimeLimit,
 						TrueUpPageSize: this.TrueUpPageSize,
+						DeleteCursorStatePath: this.options.DeleteCursorStatePath,
+						DeleteResweepIntervalHours: this.options.DeleteResweepIntervalHours,
 					};
 
 					// Apply per-entity option overrides if configured

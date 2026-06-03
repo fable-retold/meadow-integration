@@ -232,6 +232,23 @@ The `data-clone` command synchronizes entity data from a remote Meadow REST API 
 |------|-------------|
 | **Initial** | Compares the max entity ID on the server against the local database and downloads all records with IDs greater than the local maximum. Designed for first-time bulk population. |
 | **Ongoing** | Walks through all server records page by page, comparing `UpdateDate` timestamps. Creates missing records locally and updates records whose server timestamp is newer than the local copy. |
+| **OngoingEventualConsistency** | Time-budgeted variant of Ongoing: bisects the id range newest-first within `BackSyncTimeLimit`, then pulls new tail records. Reconciles deleted records separately (see below). |
+| **TrueUp** | Forward keyset walk of the whole server range to repair gaps/drift. |
+
+### Deleted-record reconciliation
+
+When `SyncDeletedRecords` is enabled, `OngoingEventualConsistency` reconciles server-side deletions into the local clone. Each deleted server row is matched to the local row by **identity only** — never by GUID, because GUIDs are not guaranteed unique in cloned data and a GUID match could soft-delete the wrong record — and flagged via `doDelete`. Rows whose id is not present locally are counted and skipped (not created). Processing is newest-first by the indexed id, within `BackSyncTimeLimit`.
+
+#### Resumable cursor options
+
+By default each run sweeps the deleted set newest-first from the top, which on a large backlog never reaches older records within the time budget. These options make the sweep resumable:
+
+| Option | Description |
+|--------|-------------|
+| `DeleteCursorStatePath` | (Optional) Path to a JSON file persisting per-table head/tail id marks so each run resumes the deleted-record sweep instead of re-walking from the newest record. Unset = disabled. The file must persist between runs to be useful; a missing/corrupt file degrades safely to a full sweep. Holds only a few integers per table — no record data. |
+| `DeleteResweepIntervalHours` | (Optional, default `168`) Once the backlog is drained, hours between full re-sweeps that catch deletions of older records landing in already-swept id ranges. |
+
+With the cursor enabled, each run runs a cheap **head pass** (`id > headID`, new deletions since last run) then continues the **tail** (`id < tailID`) within budget, using keyset paging (no growing `OFFSET`). Options propagate via `MeadowSync` options / per-entity `SyncEntityOptions`, and the strategy also reads matching keys from `fable.settings`.
 
 ### CLI Options
 
