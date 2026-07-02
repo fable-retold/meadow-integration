@@ -7,6 +7,8 @@ const libMeadowConnectionManager = require('../../services/clone/Meadow-Service-
 const libMeadowCloneRestClient = require('../../services/clone/Meadow-Service-RestClient.js');
 const libMeadowSync = require('../../services/clone/Meadow-Service-Sync.js');
 const libSessionManagerSetup = require('../../Meadow-Integration-SessionManagerSetup.js');
+const libIndexPolicy = require('../../services/clone/Meadow-Service-IndexPolicy.js');
+const libIndexConvergence = require('../../services/clone/Meadow-Service-IndexConvergence.js');
 
 // Resolve an env var with the standard `_FILE` suffix fallback for
 // secrets — so docker / k8s secret mounts work without bespoke wiring.
@@ -64,6 +66,8 @@ class DataClone extends libCLICommandLineCommand
 		this.options.CommandOptions.push({ Name: '-s, --sync_mode [sync_mode]', Description: 'The sync mode: "Initial" or "Ongoing". Default is "Initial".', DefaultValue: 'Initial' });
 
 		this.options.CommandOptions.push({ Name: '-w, --post_run_delay [post_run_delay]', Description: 'Minutes to wait after sync before exiting. Default is 0.', DefaultValue: '0' });
+
+		this.options.CommandOptions.push({ Name: '--index_config [index_config]', Description: 'Converge clone indexes before syncing. "all" applies the standard operational indexes to every table; or pass a path to a JSON index-policy file ({ StandardOperationalIndexes, PruneScope, TableIndexes }). Omit to leave indexes untouched.' });
 
 		this.addCommand();
 	}
@@ -374,6 +378,11 @@ class DataClone extends libCLICommandLineCommand
 				},
 				(fStageComplete) =>
 				{
+					// Converge indexes to the policy before syncing (opt-in via --index_config).
+					this._convergeIndexes(tmpSchemaModel, fStageComplete);
+				},
+				(fStageComplete) =>
+				{
 					// Execute the sync
 					this.fable.MeadowSync.syncAll(
 						(pSyncError) =>
@@ -404,6 +413,85 @@ class DataClone extends libCLICommandLineCommand
 					}, 10000);
 				}, tmpPostRunDelay * 60 * 1000);
 			});
+	}
+
+	/**
+	 * Converge the clone's indexes to the configured policy before syncing.
+	 * Opt-in via --index_config: "all" applies the standard operational indexes
+	 * to every table; a path loads a JSON index-policy file.  Uses the same
+	 * IndexPolicy + IndexConvergence the headless DataCloner pipeline uses.
+	 *
+	 * @param {object} pSchemaModel - loaded Meadow schema ({ Tables: {...} })
+	 * @param {Function} fCallback
+	 */
+	_convergeIndexes(pSchemaModel, fCallback)
+	{
+		let tmpIndexConfigArg = this.CommandOptions.index_config;
+		if (!tmpIndexConfigArg)
+		{
+			return fCallback();
+		}
+
+		let tmpIndexConfig;
+		if (String(tmpIndexConfigArg).toLowerCase() === 'all')
+		{
+			tmpIndexConfig = { StandardOperationalIndexes: true, PruneScope: 'managed' };
+		}
+		else
+		{
+			try
+			{
+				tmpIndexConfig = require(libPath.resolve(tmpIndexConfigArg));
+			}
+			catch (pReadError)
+			{
+				this.log.error(`Could not load --index_config ${tmpIndexConfigArg}: ${pReadError.message}`);
+				return fCallback();
+			}
+		}
+
+		let tmpProviderName = this.fable.MeadowConnectionManager && this.fable.MeadowConnectionManager.Provider;
+		let tmpProvider = tmpProviderName ? this.fable[`Meadow${tmpProviderName}Provider`] : null;
+		if (!tmpProvider || typeof(tmpProvider.introspectTableIndices) !== 'function')
+		{
+			this.log.warn(`Index convergence requested but provider '${tmpProviderName || '(unknown)'}' does not expose the index API; skipping.`);
+			return fCallback();
+		}
+
+		let tmpTables = (pSchemaModel && pSchemaModel.Tables) ? pSchemaModel.Tables : {};
+		// Converge only the tables actually deployed — respect SyncEntityList (a
+		// subset clone) so we never introspect/converge a table that was never
+		// created.  Mirrors loadMeadowSchema's filter and the headless endpoint's
+		// "deployed tables only" scope.  Empty list = all tables in the schema.
+		let tmpSyncList = (this.fable.MeadowSync && Array.isArray(this.fable.MeadowSync.SyncEntityList)) ? this.fable.MeadowSync.SyncEntityList : [];
+		let tmpTableNames = (tmpSyncList.length > 0)
+			? tmpSyncList.filter((pName) => { return tmpTables[pName]; })
+			: Object.keys(tmpTables);
+		let tmpPruneScope = tmpIndexConfig.PruneScope || libIndexConvergence.PRUNE_MANAGED;
+
+		this.log.info(`Converging indexes for ${tmpTableNames.length} deployed table(s) (prune scope: ${tmpPruneScope})...`);
+
+		this.fable.Utility.eachLimit(tmpTableNames, 1,
+			(pTableName, fNextTable) =>
+			{
+				let tmpTableSchema = tmpTables[pTableName];
+				let tmpDesired = libIndexPolicy.resolveDesiredIndexes(tmpTableSchema, tmpIndexConfig);
+				libIndexConvergence.convergeTableIndexes(tmpProvider, tmpTableSchema, tmpDesired,
+					{ PruneScope: tmpPruneScope, log: this.log },
+					(pConvergeError, pResult) =>
+					{
+						if (pConvergeError)
+						{
+							this.log.warn(`Index convergence for ${pTableName} failed: ${pConvergeError}`);
+						}
+						else if (pResult && (pResult.created.length > 0 || pResult.dropped.length > 0))
+						{
+							this.log.info(`${pTableName} — created [${pResult.created.join(', ')}], dropped [${pResult.dropped.join(', ')}]`);
+						}
+						return fNextTable();
+					});
+			},
+			() => { return fCallback(); });
 	}
 }
 

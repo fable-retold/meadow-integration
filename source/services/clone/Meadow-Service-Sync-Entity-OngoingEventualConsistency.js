@@ -260,7 +260,7 @@ class MeadowSyncEntityOngoingEventualConsistency extends libMeadowSyncEntityOngo
 								return fFinish('complete');
 							}
 
-							this.fable.Utility.eachLimit(pPageBody, 5,
+							this.fable.Utility.eachLimit(pPageBody, this.SyncRecordConcurrency,
 								(pEntityRecord, fRecordComplete) =>
 								{
 									tmpCounters.seen++;
@@ -504,7 +504,7 @@ class MeadowSyncEntityOngoingEventualConsistency extends libMeadowSyncEntityOngo
 						tmpMaxID = pPageBody[0][this.DefaultIdentifier]; // DESC → first row is the highest id
 					}
 
-					this.fable.Utility.eachLimit(pPageBody, 5,
+					this.fable.Utility.eachLimit(pPageBody, this.SyncRecordConcurrency,
 						(pEntityRecord, fRecordComplete) =>
 						{
 							tmpCounters.seen++;

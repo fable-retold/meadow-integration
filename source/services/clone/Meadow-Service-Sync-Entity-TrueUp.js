@@ -130,7 +130,7 @@ class MeadowSyncEntityTrueUp extends libMeadowSyncEntityOngoing
 									return fStageComplete();
 								}
 
-								this.fable.Utility.eachLimit(pRecords, 5,
+								this.fable.Utility.eachLimit(pRecords, this.SyncRecordConcurrency,
 									(pRecord, fRecordDone) =>
 									{
 										this._upsertRecord(pRecord,

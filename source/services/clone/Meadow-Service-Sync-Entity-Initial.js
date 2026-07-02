@@ -1,5 +1,6 @@
 const libFableServiceProviderBase = require('fable-serviceproviderbase');
 const libMeadowOperation = require('./Meadow-Service-Operation.js');
+const libSyncPoolLimit = require('./Meadow-Service-Sync-PoolLimit.js');
 
 class MeadowSyncEntityInitial extends libFableServiceProviderBase
 {
@@ -48,11 +49,38 @@ class MeadowSyncEntityInitial extends libFableServiceProviderBase
 		// override the automatic Deleted=0 filter (e.g. "includeDeleted=true").
 		this.SyncDeletedRecordsQueryString = this.options.SyncDeletedRecordsQueryString || '';
 
+		// How many records to upsert concurrently within a table.  Defaults to the
+		// DB connection pool size (capped) so fan-out never oversubscribes the pool
+		// nor runs unbounded on a very large pool.  Overridable globally or
+		// per-table via SyncEntityOptions.SyncRecordConcurrency.
+		this.SyncRecordConcurrency = this._resolveSyncRecordConcurrency(this.options.SyncRecordConcurrency);
+
 		this.Meadow = false;
 
 		this.operation = new libMeadowOperation(this.fable);
 
 		this.skipSync = false;
+	}
+
+	/**
+	 * Resolve the per-record fan-out concurrency for this entity.
+	 *
+	 * Precedence: an explicit configured value (global or per-table) wins and is
+	 * used as-is; otherwise fall back to the automatic default (pool size, capped)
+	 * — see resolveDefaultConcurrency in Meadow-Service-Sync-PoolLimit.js.
+	 *
+	 * @param {number|string} pConfigured - configured concurrency, if any
+	 * @returns {number} a positive integer concurrency
+	 */
+	_resolveSyncRecordConcurrency(pConfigured)
+	{
+		let tmpConfigured = parseInt(pConfigured, 10);
+		if (!isNaN(tmpConfigured) && tmpConfigured > 0)
+		{
+			return tmpConfigured;
+		}
+
+		return libSyncPoolLimit.resolveDefaultConcurrency(this.fable);
 	}
 
 	initialize(fCallback)
@@ -80,66 +108,18 @@ class MeadowSyncEntityInitial extends libFableServiceProviderBase
 
 			return tmpProvider.createTable(this.EntitySchema, (pCreateError) =>
 			{
-
 				if (pCreateError)
 				{
 					this.log.warn(`${this.EntitySchema.TableName}: createTable returned error: ${pCreateError}`);
 				}
 
-				// Sync-entity init intentionally does not create indexes here.
-				// In the DataCloner flow there is no MeadowConnectionManager
-				// service registered, so the legacy createIndex path was dead
-				// code that just logged noise ("No connection manager
-				// available; skipping index creation for X") for every table.
-				// Indexes are created via the provider's own createIndices /
-				// generateCreateIndexStatements methods, invoked by the
-				// DataCloner's dedicated /indices/create endpoint after the
-				// initial sync is complete — that's the point where it makes
-				// sense to build indexes, since they're expensive on populated
-				// tables.
-				//
-				// Preserve the legacy MeadowConnectionManager path for the CLI
-				// Meadow-Integration-Command-DataClone.js flow (which does
-				// register that service), but do it silently when neither
-				// indexable column nor connection manager is available.
-				const tmpGUIDColumn = this.EntitySchema.Columns.find((c) => c.DataType == 'GUID');
-				const tmpDeletedColumn = this.EntitySchema.Columns.find((c) => c.Column == 'Deleted');
-
-				let tmpCanCreateIndexes = (tmpGUIDColumn || tmpDeletedColumn)
-					&& this.fable.MeadowConnectionManager
-					&& this.fable.MeadowConnectionManager.ConnectionPool
-					&& typeof(this.fable.MeadowConnectionManager.createIndex) === 'function';
-
-				if (!tmpCanCreateIndexes)
-				{
-					return fCallback(pCreateError);
-				}
-
-				let tmpAnticipate = this.fable.newAnticipate();
-				if (tmpGUIDColumn)
-				{
-					tmpAnticipate.anticipate(
-						(fNext) =>
-						{
-							return this.fable.MeadowConnectionManager.createIndex(this.EntitySchema, tmpGUIDColumn, true, fNext);
-						});
-				}
-				if (tmpDeletedColumn)
-				{
-					tmpAnticipate.anticipate(
-						(fNext) =>
-						{
-							return this.fable.MeadowConnectionManager.createIndex(this.EntitySchema, tmpDeletedColumn, false, fNext);
-						});
-				}
-				tmpAnticipate.wait((pIndexError) =>
-				{
-					if (pIndexError)
-					{
-						this.log.warn(`${this.EntitySchema.TableName}: Index creation error: ${pIndexError}`);
-					}
-					return fCallback(pIndexError || pCreateError);
-				});
+				// Init only ensures the table exists.  Index provisioning is
+				// handled separately and authoritatively by the index-convergence
+				// step (Meadow-Service-IndexConvergence), so indexes have a single
+				// writer — the legacy per-column MeadowConnectionManager.createIndex
+				// path was retired to avoid two mechanisms fighting over the same
+				// indexes.
+				return fCallback(pCreateError);
 			});
 		}
 
@@ -249,7 +229,7 @@ class MeadowSyncEntityInitial extends libFableServiceProviderBase
 									return fPageComplete();
 								}
 
-								this.fable.Utility.eachLimit(pBody, 5,
+								this.fable.Utility.eachLimit(pBody, this.SyncRecordConcurrency,
 									(pEntityRecord, fRecordComplete) =>
 									{
 										const tmpRecordID = pEntityRecord[this.DefaultIdentifier];
@@ -545,7 +525,7 @@ class MeadowSyncEntityInitial extends libFableServiceProviderBase
 					// Shared record-processing function used by both pagination modes
 					const fProcessPageRecords = (pBody, fPageProcessComplete) =>
 					{
-						this.fable.Utility.eachLimit(pBody, 5,
+						this.fable.Utility.eachLimit(pBody, this.SyncRecordConcurrency,
 							(pEntityRecord, fRawEntitySyncComplete) =>
 							{
 								// node:sqlite resolves its callbacks synchronously, so the
