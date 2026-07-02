@@ -1,5 +1,6 @@
 const libFableServiceProviderBase = require('fable-serviceproviderbase');
 const libMeadowOperation = require('./Meadow-Service-Operation.js');
+const libSyncPoolLimit = require('./Meadow-Service-Sync-PoolLimit.js');
 
 class MeadowSyncEntityOngoing extends libFableServiceProviderBase
 {
@@ -60,11 +61,39 @@ class MeadowSyncEntityOngoing extends libFableServiceProviderBase
 			? this.options.DateTimePrecisionMS
 			: 1000;
 
+		// How many records to reconcile/upsert concurrently within a table.
+		// Defaults to the DB connection pool size (capped) so fan-out never
+		// oversubscribes the pool (a 2-connection clone must not fan out 5-wide)
+		// nor runs unbounded on a very large pool.  Overridable globally or
+		// per-table via SyncEntityOptions.SyncRecordConcurrency.
+		this.SyncRecordConcurrency = this._resolveSyncRecordConcurrency(this.options.SyncRecordConcurrency);
+
 		this.Meadow = false;
 
 		this.operation = new libMeadowOperation(this.fable);
 
 		this.skipSync = false;
+	}
+
+	/**
+	 * Resolve the per-record fan-out concurrency for this entity.
+	 *
+	 * Precedence: an explicit configured value (global or per-table) wins and is
+	 * used as-is; otherwise fall back to the automatic default (pool size, capped)
+	 * — see resolveDefaultConcurrency in Meadow-Service-Sync-PoolLimit.js.
+	 *
+	 * @param {number|string} pConfigured - configured concurrency, if any
+	 * @returns {number} a positive integer concurrency
+	 */
+	_resolveSyncRecordConcurrency(pConfigured)
+	{
+		let tmpConfigured = parseInt(pConfigured, 10);
+		if (!isNaN(tmpConfigured) && tmpConfigured > 0)
+		{
+			return tmpConfigured;
+		}
+
+		return libSyncPoolLimit.resolveDefaultConcurrency(this.fable);
 	}
 
 	initialize(fCallback)
@@ -78,46 +107,14 @@ class MeadowSyncEntityOngoing extends libFableServiceProviderBase
 
 		if (this.Meadow && this.Meadow.provider)
 		{
+			// Init only ensures the table exists.  Index provisioning is handled
+			// separately and authoritatively by the index-convergence step
+			// (Meadow-Service-IndexConvergence), so indexes have a single writer —
+			// the legacy per-column MeadowConnectionManager.createIndex path was
+			// retired to avoid two mechanisms fighting over the same indexes.
 			return this.Meadow.provider.getProvider().createTable(this.EntitySchema, (pCreateError) =>
 			{
-				// Sync-entity init intentionally does not create indexes here
-				// in the DataCloner flow.  See the comment in
-				// Meadow-Service-Sync-Entity-Initial.js for the rationale —
-				// indexes go through the provider's createIndices path
-				// (triggered by DataCloner's /indices/create endpoint) rather
-				// than via MeadowConnectionManager, which isn't registered in
-				// the DataCloner service container.
-				const tmpGUIDColumn = this.EntitySchema.Columns.find((c) => c.DataType == 'GUID');
-				const tmpDeletedColumn = this.EntitySchema.Columns.find((c) => c.Column == 'Deleted');
-
-				let tmpCanCreateIndexes = (tmpGUIDColumn || tmpDeletedColumn)
-					&& this.fable.MeadowConnectionManager
-					&& this.fable.MeadowConnectionManager.ConnectionPool
-					&& typeof(this.fable.MeadowConnectionManager.createIndex) === 'function';
-
-				if (!tmpCanCreateIndexes)
-				{
-					return fCallback(pCreateError);
-				}
-
-				let tmpAnticipate = this.fable.newAnticipate();
-				if (tmpGUIDColumn)
-				{
-					tmpAnticipate.anticipate(
-						(fNext) =>
-						{
-							return this.fable.MeadowConnectionManager.createIndex(this.EntitySchema, tmpGUIDColumn, true, fNext);
-						});
-				}
-				if (tmpDeletedColumn)
-				{
-					tmpAnticipate.anticipate(
-						(fNext) =>
-						{
-							return this.fable.MeadowConnectionManager.createIndex(this.EntitySchema, tmpDeletedColumn, false, fNext);
-						});
-				}
-				tmpAnticipate.wait((pIndexError) => { return fCallback(pCreateError); });
+				return fCallback(pCreateError);
 			});
 		}
 		return fCallback();
@@ -467,7 +464,7 @@ class MeadowSyncEntityOngoing extends libFableServiceProviderBase
 						return fCallback(null, tmpSyncedCount);
 					}
 
-					this.fable.Utility.eachLimit(pRecords, 5,
+					this.fable.Utility.eachLimit(pRecords, this.SyncRecordConcurrency,
 						(pRecord, fRecordDone) =>
 						{
 							this._upsertRecord(pRecord,
@@ -723,7 +720,7 @@ class MeadowSyncEntityOngoing extends libFableServiceProviderBase
 								return fCallback();
 							}
 
-							this.fable.Utility.eachLimit(pBody, 5,
+							this.fable.Utility.eachLimit(pBody, this.SyncRecordConcurrency,
 								(pEntityRecord, fRecordComplete) =>
 								{
 									const tmpRecordID = pEntityRecord[this.DefaultIdentifier];

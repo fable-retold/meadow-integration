@@ -4,6 +4,7 @@ const libMeadowSyncEntityOngoing = require('./Meadow-Service-Sync-Entity-Ongoing
 const libMeadowSyncEntityOngoingEventualConsistency = require('./Meadow-Service-Sync-Entity-OngoingEventualConsistency.js');
 const libMeadowSyncEntityTrueUp = require('./Meadow-Service-Sync-Entity-TrueUp.js');
 const libMeadowSyncEntityComparisonOnly = require('./Meadow-Service-Sync-Entity-ComparisonOnly.js');
+const libSyncPoolLimit = require('./Meadow-Service-Sync-PoolLimit.js');
 
 class MeadowSync extends libFableServiceProviderBase
 {
@@ -165,7 +166,16 @@ class MeadowSync extends libFableServiceProviderBase
 		let tmpErrorCount = 0;
 		let tmpSuccessCount = 0;
 
-		this.fable.Utility.eachLimit(this.MeadowSchemaTableList, 5,
+		// Bound table-initialization fan-out (createTable per table) to the DB
+		// connection pool size so deploy doesn't oversubscribe a small pool.
+		// Overridable via SyncTableInitConcurrency.
+		let tmpTableInitConcurrency = parseInt(this.options.SyncTableInitConcurrency, 10);
+		if (isNaN(tmpTableInitConcurrency) || tmpTableInitConcurrency < 1)
+		{
+			tmpTableInitConcurrency = libSyncPoolLimit.resolveDefaultConcurrency(this.fable);
+		}
+
+		this.fable.Utility.eachLimit(this.MeadowSchemaTableList, tmpTableInitConcurrency,
 			(pEntitySchemaName, fSyncInitializationComplete) =>
 			{
 				tmpEntityIndex++;
@@ -186,6 +196,7 @@ class MeadowSync extends libFableServiceProviderBase
 						TrueUpPageSize: this.TrueUpPageSize,
 						DeleteCursorStatePath: this.options.DeleteCursorStatePath,
 						DeleteResweepIntervalHours: this.options.DeleteResweepIntervalHours,
+						SyncRecordConcurrency: this.options.SyncRecordConcurrency,
 					};
 
 					// Apply per-entity option overrides if configured

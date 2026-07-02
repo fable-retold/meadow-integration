@@ -73,6 +73,15 @@ class MeadowConnectionManager extends libFableServiceProviderBase
 			// Apply MySQL settings to fable settings for meadow provider
 			this.fable.settings.MySQL = tmpConfig;
 
+			// Point the meadow ORM at this provider.  MeadowConnectionManager
+			// connects the connector (fable.MeadowMSSQLProvider/MySQLProvider),
+			// but the meadow instance built in Meadow-Service-Sync selects its
+			// provider from fable.settings.MeadowProvider (default 'None').
+			// Without this the ORM stays on the 'None' provider and createTable
+			// (via provider.getProvider()) has nothing to call.  Set before the
+			// sync service is instantiated so meadow picks it up.
+			this.fable.settings.MeadowProvider = this.Provider;
+
 			this.fable.serviceManager.addServiceType('MeadowMySQLProvider', libMeadowConnectionMySQL);
 			this.fable.serviceManager.instantiateServiceProvider('MeadowMySQLProvider', tmpConfig);
 
@@ -107,6 +116,11 @@ class MeadowConnectionManager extends libFableServiceProviderBase
 
 			// Apply MSSQL settings to fable settings for meadow provider
 			this.fable.settings.MSSQL = tmpConfig;
+
+			// Point the meadow ORM at this provider (see the MySQL branch for
+			// the full rationale) — without it the ORM stays on 'None' and
+			// createTable has no underlying connector to call.
+			this.fable.settings.MeadowProvider = this.Provider;
 
 			this.fable.serviceManager.addServiceType('MeadowMSSQLProvider', libMeadowConnectionMSSQL);
 			this.fable.serviceManager.instantiateServiceProvider('MeadowMSSQLProvider', tmpConfig);
