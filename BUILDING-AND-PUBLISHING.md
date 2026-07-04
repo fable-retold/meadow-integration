@@ -170,7 +170,7 @@ postpublish: BUILD_DOCKER=1 → tag + push       ← image trigger
   ↓ (tag arrives at GitHub)
 .github/workflows/publish-image.yml fires:
   - docker buildx build --platform linux/amd64,linux/arm64
-  - docker push ghcr.io/stevenvelozo/meadow-integration:<version>
+  - docker push ghcr.io/fable-retold/meadow-integration:<version>
   - tags: <version>, <major>.<minor>, <major>, latest
 ```
 
@@ -189,14 +189,14 @@ After `release:patch` completes:
 2. **GHCR workflow**: visit
    `https://github.com/fable-retold/meadow-integration/actions` and
    confirm the "Publish container image" run succeeded.
-3. **Image**: `docker pull ghcr.io/stevenvelozo/meadow-integration:<version>`
+3. **Image**: `docker pull ghcr.io/fable-retold/meadow-integration:<version>`
    should succeed. The image is also tagged as `latest`, `<major>`, and
    `<major>.<minor>`.
 4. **Smoke test** (one-shot — runs the bundled BookStore default schema
    against a non-existent API; expect it to fail at the data-fetch step,
    which proves the binary started correctly):
    ```bash
-   docker run --rm ghcr.io/stevenvelozo/meadow-integration:latest
+   docker run --rm ghcr.io/fable-retold/meadow-integration:latest
    ```
 
 ---
@@ -280,7 +280,7 @@ whatever stability level fits.
 ### Pull and run (one-shot)
 
 ```bash
-docker pull ghcr.io/stevenvelozo/meadow-integration:latest
+docker pull ghcr.io/fable-retold/meadow-integration:latest
 
 # Single sync run; container exits when done
 docker run --rm \
@@ -293,7 +293,7 @@ docker run --rm \
   -e MEADOW_INTEGRATION_DB_NAME=mydatabase \
   -e MEADOW_INTEGRATION_SCHEMA_PATH=/schemas/my-schema.json \
   -v $(pwd)/schemas:/schemas:ro \
-  ghcr.io/stevenvelozo/meadow-integration:latest
+  ghcr.io/fable-retold/meadow-integration:latest
 ```
 
 ### Configuration via env vars

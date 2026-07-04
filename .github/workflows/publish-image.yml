@@ -9,8 +9,8 @@
 #   - One step to wire: GITHUB_TOKEN already has `packages: write`
 #
 # Image lands at:
-#   ghcr.io/stevenvelozo/meadow-integration:<version>
-#   ghcr.io/stevenvelozo/meadow-integration:latest   (only on the
+#   ghcr.io/fable-retold/meadow-integration:<version>
+#   ghcr.io/fable-retold/meadow-integration:latest   (only on the
 #                                                     highest stable tag)
 #
 # Manual run: `Actions → Publish container image → Run workflow`,
