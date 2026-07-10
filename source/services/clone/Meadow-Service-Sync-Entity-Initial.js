@@ -546,8 +546,16 @@ class MeadowSyncEntityInitial extends libFableServiceProviderBase
 					const fProcessPageRecords = (pBody, fPageProcessComplete) =>
 					{
 						this.fable.Utility.eachLimit(pBody, 5,
-							(pEntityRecord, fEntitySyncComplete) =>
+							(pEntityRecord, fRawEntitySyncComplete) =>
 							{
+								// node:sqlite resolves its callbacks synchronously, so the
+								// per-record Meadow behavior chain (doCreate -> CollisionRename
+								// -> doRead, threaded through async.waterfall/eachOfLimit) never
+								// yields and the call stack grows with the record count until it
+								// overflows on large syncs. Defer each record's completion so the
+								// stack unwinds between records — the same guard the advanced-ID
+								// pagination path applies with setImmediate(fFetchPage) below.
+								const fEntitySyncComplete = (pError) => setImmediate(() => fRawEntitySyncComplete(pError));
 								const tmpRecord = pEntityRecord;
 								const tmpQuery = this.Meadow.query;
 

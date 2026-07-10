@@ -23,6 +23,33 @@ function valueTemplate(pColumn)
 	return `{~D:Record.${pColumn}~}`;
 }
 
+/**
+ * The value template for an entity's OWN key segment — the combinatorial-GUID input. Three shapes, in
+ * precedence order: a user-typed pict template `OwnKeyTemplate` (any expression, e.g.
+ * `{~D:Record.A~}-{~D:Record.B~}`); multiple columns `OwnKeyColumns` concatenated into one segment; or a
+ * single `OwnKeyColumn` (the original behavior). The transform resolves the whole string per row via
+ * fable's parseTemplate, so multiple `{~D:Record.X~}` tags in one segment just work.
+ * @param {Record<string, any>} pEntityConfig
+ * @returns {string}
+ */
+function ownValueTemplate(pEntityConfig)
+{
+	const tmpConfig = pEntityConfig || {};
+	if (tmpConfig.OwnKeyTemplate)
+	{
+		return String(tmpConfig.OwnKeyTemplate);
+	}
+	if (Array.isArray(tmpConfig.OwnKeyColumns) && (tmpConfig.OwnKeyColumns.length > 0))
+	{
+		return tmpConfig.OwnKeyColumns.map((pColumn) => valueTemplate(pColumn)).join('');
+	}
+	if (tmpConfig.OwnKeyColumn)
+	{
+		return valueTemplate(tmpConfig.OwnKeyColumn);
+	}
+	return '';
+}
+
 /** Derive a short uppercase abbreviation for an entity with no catalog entry (initials / first letters). */
 function _deriveAbbreviation(pEntityName)
 {
@@ -108,11 +135,12 @@ function _ownSegments(pEntityName, pEntityConfig, pContext)
 		tmpSegments.push({ abbrev: abbreviationFor(pParentEntity, pContext), valueTemplate: tmpKeyColumn ? valueTemplate(tmpKeyColumn) : '' });
 	});
 
-	if (!pEntityConfig.OwnKeyColumn)
+	const tmpOwnValue = ownValueTemplate(pEntityConfig);
+	if (!tmpOwnValue)
 	{
-		tmpWarnings.push(`"${pEntityName}" has no own-key column mapped — its GUID cannot be stable, so re-imports will create duplicates. Map a natural-key column (e.g. a code).`);
+		tmpWarnings.push(`"${pEntityName}" has no own-key column mapped — its GUID cannot be stable, so re-imports will create duplicates. Map a natural-key column (e.g. a code), several columns, or a template.`);
 	}
-	tmpSegments.push({ abbrev: abbreviationFor(pEntityName, pContext), valueTemplate: pEntityConfig.OwnKeyColumn ? valueTemplate(pEntityConfig.OwnKeyColumn) : '' });
+	tmpSegments.push({ abbrev: abbreviationFor(pEntityName, pContext), valueTemplate: tmpOwnValue });
 
 	return { segments: tmpSegments, warnings: tmpWarnings };
 }
@@ -252,4 +280,5 @@ module.exports = {
 	joinFieldName,
 	abbreviationFor,
 	valueTemplate,
+	ownValueTemplate,
 };

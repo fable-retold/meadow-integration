@@ -63,6 +63,29 @@ suite
 		);
 		test
 		(
+			'combinatorial own key: multiple columns concatenate into one own segment',
+			() =>
+			{
+				const tmpConfig = { Prefix: 'UI', Entities: { Project: { Mode: 'prefixed', OwnKeyColumns: [ 'District', 'ProjectCode' ] } } };
+				const tmpProject = libStrategy.compile(tmpConfig, { Catalog: CATALOG, SchemaSizes: SIZES }).Strategies.Project;
+				Expect(tmpProject.Own.Compose.segments).to.have.length(1);
+				Expect(tmpProject.Own.Compose.segments[0].valueTemplate).to.equal('{~D:Record.District~}{~D:Record.ProjectCode~}');
+			}
+		);
+		test
+		(
+			'combinatorial own key: a user-typed pict template becomes the own segment verbatim (and wins over a single column)',
+			() =>
+			{
+				const tmpConfig = { Prefix: 'UI', Entities: { Project: { Mode: 'prefixed', OwnKeyTemplate: '{~D:Record.District~}-{~D:Record.ProjectCode~}' } } };
+				const tmpProject = libStrategy.compile(tmpConfig, { Catalog: CATALOG, SchemaSizes: SIZES }).Strategies.Project;
+				Expect(tmpProject.Own.Compose.segments[0].valueTemplate).to.equal('{~D:Record.District~}-{~D:Record.ProjectCode~}');
+				const tmpBoth = libStrategy.compile({ Prefix: 'UI', Entities: { Project: { OwnKeyColumn: 'X', OwnKeyTemplate: 'T{~D:Record.Y~}' } } }, { Catalog: CATALOG }).Strategies.Project;
+				Expect(tmpBoth.Own.Compose.segments[0].valueTemplate).to.equal('T{~D:Record.Y~}');
+			}
+		);
+		test
+		(
 			'composes the headline LineItem own GUID from context + own segments',
 			() =>
 			{

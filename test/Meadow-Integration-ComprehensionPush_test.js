@@ -10,6 +10,7 @@
 const Chai = require('chai');
 const Expect = Chai.expect;
 
+const libPath = require('path');
 const libFable = require('fable');
 const libMeadowConnectionSQLite = require('meadow-connection-sqlite');
 const libRetoldDataService = require('retold-data-service');
@@ -291,7 +292,7 @@ suite
 						_Fable.serviceManager.addServiceType('RetoldDataService', libRetoldDataService);
 						_RetoldDataService = _Fable.serviceManager.instantiateServiceProvider('RetoldDataService',
 							{
-								FullMeadowSchemaPath: `${__dirname}/../node_modules/retold-harness/source/schemas/bookstore/`,
+								FullMeadowSchemaPath: `${libPath.dirname(require.resolve('retold-harness/source/schemas/bookstore/Schema.json'))}/`,
 								FullMeadowSchemaFilename: `Schema.json`,
 
 								StorageProvider: 'SQLite',
