@@ -1,6 +1,6 @@
 {
     "name": "meadow-integration",
-    "version": "1.1.3",
+    "version": "1.1.4",
     "description": "Meadow Data Integration",
     "retoldBeacon": {
         "displayName": "Meadow Integration",
@@ -82,14 +82,14 @@
         ]
     },
     "dependencies": {
-        "fable": "^3.1.79",
+        "fable": "^3.1.80",
         "fable-serviceproviderbase": "^3.0.19",
         "fast-xml-parser": "^4.4.1",
         "meadow": "^2.0.47",
         "meadow-connection-mssql": "^1.0.24",
         "meadow-connection-mysql": "^1.0.20",
-        "orator": "^6.1.2",
-        "orator-serviceserver-restify": "^2.0.11",
+        "orator": "^6.1.3",
+        "orator-serviceserver-restify": "^2.0.12",
         "pict-provider-theme": "^1.1.2",
         "pict-section-flow": "^1.0.1",
         "pict-section-modal": "^1.3.2",

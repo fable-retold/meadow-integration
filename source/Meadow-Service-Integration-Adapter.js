@@ -97,18 +97,26 @@ class MeadowIntegrationAdapter extends libFableServiceProviderBase
 			this.EntityGUIDMarshalPrefix = `E-${this.Entity}`;
 		}
 
-		// Resolve GUID max length: explicit option > GUIDColumnSizes > DefaultGUIDColumnSize
+		// Resolve GUID max length: explicit option > GUIDColumnSizes > live server schema > DefaultGUIDColumnSize.
+		// GUIDMaxLengthResolved tracks whether the width came from a real source; loadSchema() fills it in
+		// from the server when it did not, and the length-check error names the source either way.
 		if (this.options.GUIDMaxLength > 0)
 		{
 			this.GUIDMaxLength = this.options.GUIDMaxLength;
+			this.GUIDMaxLengthSource = 'the GUIDMaxLength option';
+			this.GUIDMaxLengthResolved = true;
 		}
 		else if (this.options.GUIDColumnSizes && this.options.GUIDColumnSizes.hasOwnProperty(this.Entity))
 		{
 			this.GUIDMaxLength = this.options.GUIDColumnSizes[this.Entity];
+			this.GUIDMaxLengthSource = 'the GUIDColumnSizes option';
+			this.GUIDMaxLengthResolved = true;
 		}
 		else
 		{
 			this.GUIDMaxLength = this.options.DefaultGUIDColumnSize;
+			this.GUIDMaxLengthSource = 'the DefaultGUIDColumnSize fallback';
+			this.GUIDMaxLengthResolved = false;
 		}
 		this.AllowGUIDTruncation = this.options.AllowGUIDTruncation;
 		this.GUIDTruncationStrategy = this.options.GUIDTruncationStrategy || 'substring';
@@ -173,6 +181,135 @@ class MeadowIntegrationAdapter extends libFableServiceProviderBase
 	}
 
 	/**
+	 * Read this entity's GUID column width out of an entity schema document.
+	 *
+	 * meadow-endpoints answers GET /{Entity}/Schema with the DAL JSONSchema, which carries widths on
+	 * `properties[Column].size` and repeats the meadow schema array at `MeadowSchema.Schema`.  Other
+	 * meadow-compatible servers hand back a bare `Columns` array, so all three are tolerated.
+	 *
+	 * @param {Object} pSchemaDocument - The entity schema document
+	 * @returns {number} The GUID column width, or 0 when the document does not describe one
+	 */
+	_readGUIDColumnSizeFromSchema(pSchemaDocument)
+	{
+		if (!pSchemaDocument || typeof(pSchemaDocument) !== 'object')
+		{
+			return 0;
+		}
+
+		if (pSchemaDocument.properties && pSchemaDocument.properties[this.EntityGUIDName])
+		{
+			let tmpPropertySize = Number(pSchemaDocument.properties[this.EntityGUIDName].size);
+			if (tmpPropertySize > 0)
+			{
+				return tmpPropertySize;
+			}
+		}
+
+		let tmpColumns = false;
+		if (Array.isArray(pSchemaDocument.Columns))
+		{
+			tmpColumns = pSchemaDocument.Columns;
+		}
+		else if (pSchemaDocument.MeadowSchema && Array.isArray(pSchemaDocument.MeadowSchema.Schema))
+		{
+			tmpColumns = pSchemaDocument.MeadowSchema.Schema;
+		}
+
+		if (tmpColumns)
+		{
+			let tmpGUIDColumn = tmpColumns.find((pColumn) => pColumn.Column === this.EntityGUIDName);
+			let tmpColumnSize = tmpGUIDColumn ? Number(tmpGUIDColumn.Size) : 0;
+			if (tmpColumnSize > 0)
+			{
+				return tmpColumnSize;
+			}
+		}
+
+		return 0;
+	}
+
+	/**
+	 * Stash an entity schema document on the adapter and adopt its GUID column width when the caller
+	 * did not already pin one via GUIDMaxLength or GUIDColumnSizes.
+	 *
+	 * @param {Object} pSchemaDocument - The entity schema document
+	 */
+	_applySchemaDocument(pSchemaDocument)
+	{
+		if (!pSchemaDocument || typeof(pSchemaDocument) !== 'object')
+		{
+			return;
+		}
+
+		this.meadowSchema = pSchemaDocument;
+
+		if (this.GUIDMaxLengthResolved)
+		{
+			return;
+		}
+
+		let tmpSchemaSize = this._readGUIDColumnSizeFromSchema(pSchemaDocument);
+
+		if (tmpSchemaSize < 1)
+		{
+			this.log.warn(`Server schema for [${this.Entity}] did not describe a width for [${this.EntityGUIDName}]; GUID length stays at ${this.GUIDMaxLength} from ${this.GUIDMaxLengthSource}.`);
+			return;
+		}
+
+		if (tmpSchemaSize !== this.GUIDMaxLength)
+		{
+			this.log.info(`Server schema GUID column size for [${this.Entity}] is ${tmpSchemaSize} (local had ${this.GUIDMaxLength}); using server value.`);
+		}
+		else
+		{
+			this.log.trace(`Server schema confirms GUID column size for [${this.Entity}]: ${tmpSchemaSize}`);
+		}
+
+		this.GUIDMaxLength = tmpSchemaSize;
+		this.GUIDMaxLengthSource = 'the live server schema';
+		this.GUIDMaxLengthResolved = true;
+	}
+
+	/**
+	 * Fetch the entity schema from the server and adopt the authoritative GUID column width.
+	 *
+	 * integrateRecords() calls this first.  Consumers that drive marshalSourceRecords() themselves must
+	 * call it explicitly, or the GUID length check runs against DefaultGUIDColumnSize.  Idempotent: once
+	 * a schema has been applied, further calls are a no-op.
+	 *
+	 * @param {(error?: Error) => void} fCallback - Callback fired when the schema has been loaded (or failed to load)
+	 */
+	loadSchema(fCallback)
+	{
+		if (this.meadowSchema && (typeof(this.meadowSchema) === 'object'))
+		{
+			return fCallback();
+		}
+
+		let tmpClient = this._resolveClient();
+
+		if (!tmpClient)
+		{
+			return fCallback(new Error(`No REST client available for [${this.Entity}].`));
+		}
+
+		this.fable.log.info(`Getting schema for ${this.Entity}....`);
+
+		return tmpClient.getJSON(`${this.Entity}/Schema`,
+			(pError, pResponse, pParsedBody) =>
+			{
+				// getJSON returns (pError, pResponse, pParsedBody).  Use the parsed body (3rd arg) if
+				// present; fall back to pResponse for clients that return (pError, pBody) only.
+				let tmpBody = (typeof(pParsedBody) === 'object') ? pParsedBody : pResponse;
+
+				this._applySchemaDocument(tmpBody);
+
+				return fCallback(pError);
+			});
+	}
+
+	/**
 	 * The combined GUID prefix string.
 	 *
 	 * @returns {string} The GUID prefix
@@ -211,11 +348,17 @@ class MeadowIntegrationAdapter extends libFableServiceProviderBase
 		{
 			if (!this.AllowGUIDTruncation)
 			{
-				let tmpMessage = `Generated GUID for [${this.Entity}] exceeds the maximum allowed length of ${this.GUIDMaxLength} characters.\n`
+				let tmpMessage = `Generated GUID for [${this.Entity}] is ${tmpFullGUID.length} characters, exceeding the limit of ${this.GUIDMaxLength} from ${this.GUIDMaxLengthSource}.\n`
 					+ `  Comprehension GUID: [${pExternalGUID}] (${pExternalGUID.length} chars)\n`
 					+ `  Server GUID:        [${tmpFullGUID}] (${tmpFullGUID.length} chars)\n`
-					+ `  Prefix:             [${this.GUIDPrefix}] (${this.GUIDPrefix.length} chars)\n`
-					+ `  To allow automatic prefix truncation for one-time imports, set AllowGUIDTruncation to true (CLI: --allowguidtruncation).`;
+					+ `  Prefix:             [${this.GUIDPrefix}] (${this.GUIDPrefix.length} chars)\n`;
+
+				if (!this.GUIDMaxLengthResolved)
+				{
+					tmpMessage += `  No column width was resolved for [${this.Entity}] -- this limit is not the column's limit.  Call loadSchema() (integrateRecords() does) before marshaling, or supply GUIDColumnSizes / GUIDMaxLength if the column is wider.\n`;
+				}
+
+				tmpMessage += `  To allow automatic prefix truncation for one-time imports, set AllowGUIDTruncation to true (CLI: --allowguidtruncation).`;
 				this.log.error(tmpMessage);
 				throw new Error(tmpMessage);
 			}
@@ -274,49 +417,7 @@ class MeadowIntegrationAdapter extends libFableServiceProviderBase
 		tmpAnticipate.anticipate(
 			(fStageComplete) =>
 			{
-				this.fable.log.info(`Getting schema for ${this.Entity}....`);
-
-				let tmpSchemaURL = `${this.Entity}/Schema`;
-
-				tmpClient.getJSON(tmpSchemaURL,
-					(pError, pResponse, pParsedBody) =>
-					{
-						// getJSON returns (pError, pResponse, pParsedBody).
-						// Use the parsed body (3rd arg) if present; fall back to
-						// pResponse for clients that return (pError, pBody) only.
-						let tmpBody = (typeof(pParsedBody) === 'object') ? pParsedBody : pResponse;
-
-						if (tmpBody && (typeof(tmpBody) == 'object'))
-						{
-							this.meadowSchema = tmpBody;
-
-							// Override the GUID column size from the live server schema when
-							// the caller has not explicitly set a positive GUIDMaxLength option.
-							if (this.options.GUIDMaxLength <= 0 && Array.isArray(tmpBody.Columns))
-							{
-								let tmpGuidColumn = tmpBody.Columns.find((c) => c.Column === this.EntityGUIDName);
-								if (tmpGuidColumn && Number(tmpGuidColumn.Size) > 0)
-								{
-									let tmpServerSize = Number(tmpGuidColumn.Size);
-									if (tmpServerSize !== this.GUIDMaxLength)
-									{
-										this.log.info(`Server schema GUID column size for [${this.Entity}] is ${tmpServerSize} (local had ${this.GUIDMaxLength}); using server value.`);
-									}
-									else
-									{
-										this.log.trace(`Server schema confirms GUID column size for [${this.Entity}]: ${tmpServerSize}`);
-									}
-									this.GUIDMaxLength = tmpServerSize;
-								}
-							}
-
-							return fStageComplete(pError);
-						}
-						else
-						{
-							return fStageComplete(pError);
-						}
-					});
+				this.loadSchema(fStageComplete);
 			});
 		tmpAnticipate.anticipate(
 			(fStageComplete) =>

@@ -65,12 +65,16 @@ The adapter validates that generated GUIDs do not exceed the server's GUID colum
 
 1. **Explicit `GUIDMaxLength` option** -- positive integer overrides everything
 2. **`GUIDColumnSizes` map** -- per-entity sizes passed in options (e.g. from a schema build step)
-3. **Live server schema** -- fetched via `GET /Entity/Schema` during `integrateRecords()`
+3. **Live server schema** -- fetched via `GET /Entity/Schema` by `loadSchema()`
 4. **`DefaultGUIDColumnSize`** -- fallback (default: 36)
+
+`integrateRecords()` calls `loadSchema()` before it marshals, so the schema-derived width is in place by the time GUIDs are checked. **Consumers that drive `marshalSourceRecords()` / `pushRecordsToServer()` themselves must call `loadSchema()` first** -- otherwise every entity is checked against `DefaultGUIDColumnSize` (36), which is narrower than most GUID columns and has nothing to do with the real one. `loadSchema()` is idempotent.
+
+The width is read from `properties[GUID<Entity>].size` on the schema document (the shape meadow-endpoints returns), falling back to a `MeadowSchema.Schema` or top-level `Columns` array for other meadow-compatible servers.
 
 When a GUID exceeds the maximum length:
 
-- **Default behavior** (`AllowGUIDTruncation: false`): Throws an error with a clear message showing the GUID, prefix, and limit.
+- **Default behavior** (`AllowGUIDTruncation: false`): Throws an error showing the GUID, prefix, limit, and which of the four sources above the limit came from. When the limit is the unresolved `DefaultGUIDColumnSize`, the message says so explicitly -- that number is not the column's width.
 - **Truncation mode** (`AllowGUIDTruncation: true`): The prefix is progressively truncated to fit while preserving the full external GUID. Use this for one-time imports where GUID stability is not required.
 
 ### Cross-Entity GUID Resolution
@@ -245,7 +249,7 @@ let tmpAdapter = libAdapter.getAdapter(myFable, 'Book', 'BK',
 | `EntityGUIDMarshalPrefix` | string or false | `false` (auto: `"E-{Entity}"`) | Per-entity prefix in generated GUIDs |
 | `GUIDMaxLength` | number | `0` (auto-detect) | Maximum GUID length; 0 = resolve from schema |
 | `GUIDColumnSizes` | object | `{}` | Per-entity GUID column sizes (entity name -> max size) |
-| `DefaultGUIDColumnSize` | number | `36` | Fallback GUID column size |
+| `DefaultGUIDColumnSize` | number | `36` | Fallback GUID column size, used only until `loadSchema()` resolves the real one |
 | `AllowGUIDTruncation` | boolean | `false` | Allow prefix truncation for oversized GUIDs |
 | `SimpleMarshal` | boolean | `false` | Pass through schema-matched fields without type coercion |
 | `ForceMarshal` | boolean | `false` | Include fields not found in schema |
