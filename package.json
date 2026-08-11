@@ -1,6 +1,6 @@
 {
     "name": "meadow-integration",
-    "version": "1.1.4",
+    "version": "1.1.5",
     "description": "Meadow Data Integration",
     "retoldBeacon": {
         "displayName": "Meadow Integration",
@@ -85,7 +85,7 @@
         "fable": "^3.1.80",
         "fable-serviceproviderbase": "^3.0.19",
         "fast-xml-parser": "^4.4.1",
-        "meadow": "^2.0.47",
+        "meadow": "^2.0.48",
         "meadow-connection-mssql": "^1.0.24",
         "meadow-connection-mysql": "^1.0.20",
         "orator": "^6.1.3",

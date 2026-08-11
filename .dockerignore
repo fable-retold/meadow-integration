@@ -9,3 +9,6 @@ Docker-*.sh
 logs
 *.patch
 debug
+
+# Harness images build from this root; never ship nested installs.
+integration/*/*/node_modules

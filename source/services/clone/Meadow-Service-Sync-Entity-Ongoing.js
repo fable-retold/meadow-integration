@@ -330,12 +330,13 @@ class MeadowSyncEntityOngoing extends libFableServiceProviderBase
 	{
 		const tmpRecordToCommit = this.marshalRecord(pServerRecord);
 
+		// Delete tracking is disabled on this existence check so a locally
+		// soft-deleted row is still found: the source only serves live records
+		// here, so a hit on a Deleted=1 row means it was un-deleted upstream and
+		// must be updated (Deleted=0) rather than re-created over its own id.
 		const tmpQuery = this.Meadow.query;
 		tmpQuery.addFilter(this.DefaultIdentifier, pServerRecord[this.DefaultIdentifier]);
-		if (!this._hasDeletedColumn)
-		{
-			tmpQuery.setDisableDeleteTracking(true);
-		}
+		tmpQuery.setDisableDeleteTracking(true);
 
 		this.Meadow.doRead(tmpQuery,
 			(pReadError, pQuery, pLocalRecord) =>

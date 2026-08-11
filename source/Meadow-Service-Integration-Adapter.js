@@ -53,6 +53,39 @@ const defaultMeadowIntegrationAdapterOptions = (
 		"ApiURLPrefix": '/1.0/'
 	});
 
+/**
+ * Is a source record's `Deleted` flag set, in whatever shape the source produced it?
+ *
+ * Storage layers disagree about how a boolean is represented and every one of them is legitimate:
+ * MySQL's `tinyint` arrives as `1`/`0` through mysql2, PostgreSQL gives a real `true`/`false`, and
+ * anything that has been through JSON, a CSV, a spreadsheet or a template arrives as the string
+ * `"1"`. A strict `=== true` honoured only the second of those and silently treated the rest as a
+ * live record — an upsert instead of a delete, reported as success.
+ *
+ * Only the SET side is widened. `0`, `"0"`, `""`, `false`, `"false"`, `null`, `undefined` and an
+ * absent property all remain not-deleted, so a record can never become a delete by accident.
+ *
+ * @param {any} pValue - the source record's `Deleted` value, in any representation
+ * @return {boolean} true when the record should be routed to the delete pass
+ */
+const isDeletedFlagSet = function(pValue)
+{
+	if (typeof (pValue) === 'boolean')
+	{
+		return pValue;
+	}
+	if (typeof (pValue) === 'number')
+	{
+		return (pValue !== 0);
+	}
+	if (typeof (pValue) === 'string')
+	{
+		const tmpValue = pValue.trim().toLowerCase();
+		return (tmpValue === '1') || (tmpValue === 'true') || (tmpValue === 't') || (tmpValue === 'y') || (tmpValue === 'yes');
+	}
+	return false;
+};
+
 class MeadowIntegrationAdapter extends libFableServiceProviderBase
 {
 	constructor(pFable, pOptions, pServiceHash)
@@ -676,7 +709,7 @@ class MeadowIntegrationAdapter extends libFableServiceProviderBase
 		}
 
 		// 0.5 Check if this is a delete
-		let tmpDeleteOperation = (tmpSourceRecord.Deleted === true);
+		let tmpDeleteOperation = isDeletedFlagSet(tmpSourceRecord.Deleted);
 
 		// 1. Marshal the Source record into a Meadow record
 		let tmpMarshaledRecord = await this.marshalRecord(tmpSourceRecord);
@@ -1105,3 +1138,6 @@ module.exports.getAdapter = (
 	});
 
 module.exports.default_configuration = defaultMeadowIntegrationAdapterOptions;
+
+// Exported for testing: the predicate that decides whether a source record is a delete.
+module.exports.isDeletedFlagSet = isDeletedFlagSet;
