@@ -36,19 +36,19 @@ const _BookExtendedSchema =
 			TableName: 'Book',
 			Columns:
 			[
-				{ Column: 'IDBook',          DataType: 'int' },
+				{ Column: 'IDBook',          DataType: 'ID' },
 				{ Column: 'GUIDBook',        DataType: 'GUID' },
 				{ Column: 'CreateDate',      DataType: 'DateTime' },
-				{ Column: 'CreatingIDUser',  DataType: 'int' },
+				{ Column: 'CreatingIDUser',  DataType: 'Numeric' },
 				{ Column: 'UpdateDate',      DataType: 'DateTime' },
-				{ Column: 'UpdatingIDUser',  DataType: 'int' },
-				{ Column: 'Deleted',         DataType: 'int' },
+				{ Column: 'UpdatingIDUser',  DataType: 'Numeric' },
+				{ Column: 'Deleted',         DataType: 'Boolean' },
 				{ Column: 'DeleteDate',      DataType: 'DateTime' },
-				{ Column: 'DeletingIDUser',  DataType: 'int' },
+				{ Column: 'DeletingIDUser',  DataType: 'Numeric' },
 				{ Column: 'Title',           DataType: 'String' },
 				{ Column: 'Type',            DataType: 'String' },
 				{ Column: 'Genre',           DataType: 'String' },
-				{ Column: 'PublicationYear', DataType: 'int' }
+				{ Column: 'PublicationYear', DataType: 'Numeric' }
 			],
 			MeadowSchema:
 			{

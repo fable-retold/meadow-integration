@@ -29,7 +29,7 @@ const _MinimalEntitySchema =
 	[
 		{ Column: 'IDBook',   DataType: 'ID'   },
 		{ Column: 'GUIDBook', DataType: 'GUID' },
-		{ Column: 'Deleted',  DataType: 'int'  },
+		{ Column: 'Deleted',  DataType: 'Boolean' },
 		{ Column: 'Title',    DataType: 'String' }
 	],
 	MeadowSchema:
