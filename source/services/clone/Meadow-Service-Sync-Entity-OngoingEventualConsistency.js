@@ -1,5 +1,6 @@
 const libMeadowSyncEntityOngoing = require('./Meadow-Service-Sync-Entity-Ongoing.js');
 const libMeadowDeleteCursorStore = require('./Meadow-Service-DeleteCursorStore.js');
+const libMeadowDeleteStamp = require('./Meadow-Service-Sync-DeleteStamp.js');
 
 class MeadowSyncEntityOngoingEventualConsistency extends libMeadowSyncEntityOngoing
 {
@@ -334,8 +335,11 @@ class MeadowSyncEntityOngoingEventualConsistency extends libMeadowSyncEntityOngo
 				// delete-tracking columns nor trips the delete-tracking-filtered
 				// post-update verify read.  DeleteDate is the local detection time
 				// (meadow has no path to set the source's value); fine for the clone.
+				// Delete tracking stays ENABLED on this query — disabling it makes
+				// foxhound emit a hard DELETE FROM instead of the soft-delete UPDATE.
 				const tmpDeleteQuery = this.Meadow.query;
 				tmpDeleteQuery.addFilter(this.DefaultIdentifier, tmpRecordID);
+				tmpDeleteQuery.setIDUser(libMeadowDeleteStamp.resolveDeletingIDUser(this.Meadow.schema, pEntityRecord));
 
 				this.Meadow.doDelete(tmpDeleteQuery,
 					(pDeleteError) =>

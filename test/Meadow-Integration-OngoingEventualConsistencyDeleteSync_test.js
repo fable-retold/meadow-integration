@@ -267,6 +267,7 @@ suite
 						const tmp101 = bookByID(_Fable, 101);
 						Expect(tmp101.Deleted).to.equal(1, 'id 101 flagged deleted');
 						Expect(tmp101.DeleteDate).to.be.a('string').and.not.equal('', 'DeleteDate stamped on delete');
+						Expect(tmp101.DeletingIDUser).to.equal(7, 'the SOURCE deleting user is propagated, not 0');
 
 						// THE SAFETY CASE: id 777 shares GUID-BOOK-103 with the server-deleted id
 						// 103, but is a DIFFERENT, active record. It must be left untouched —

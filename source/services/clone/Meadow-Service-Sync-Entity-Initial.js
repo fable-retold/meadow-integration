@@ -1,6 +1,7 @@
 const libFableServiceProviderBase = require('fable-serviceproviderbase');
 const libMeadowOperation = require('./Meadow-Service-Operation.js');
 const libSyncPoolLimit = require('./Meadow-Service-Sync-PoolLimit.js');
+const libMeadowDeleteStamp = require('./Meadow-Service-Sync-DeleteStamp.js');
 
 class MeadowSyncEntityInitial extends libFableServiceProviderBase
 {
@@ -276,23 +277,41 @@ class MeadowSyncEntityInitial extends libFableServiceProviderBase
 													return fRecordComplete();
 												}
 
-												// Record exists locally but is not deleted -- update it
-												const tmpRecordToCommit = this.marshalRecord(pEntityRecord);
+												// Record exists locally but is not deleted -- flag it, then sync its
+												// columns.  doDelete comes first because it is the only write that can
+												// set the delete audit columns: foxhound skips DeleteDate/DeleteIDUser on
+												// every UPDATE, and stamps DeleteIDUser from the query rather than from
+												// the record.  The doUpdate that follows carries the source's remaining
+												// column values and leaves those stamps alone.
+												const tmpDeleteQuery = this.Meadow.query;
+												tmpDeleteQuery.addFilter(this.DefaultIdentifier, tmpRecordID);
+												tmpDeleteQuery.setIDUser(libMeadowDeleteStamp.resolveDeletingIDUser(this.Meadow.schema, pEntityRecord));
 
-												const tmpUpdateQuery = this.Meadow.query.addRecord(tmpRecordToCommit);
-												tmpUpdateQuery.setDisableAutoIdentity(true);
-												tmpUpdateQuery.setDisableAutoDateStamp(true);
-												tmpUpdateQuery.setDisableAutoUserStamp(true);
-												tmpUpdateQuery.setDisableDeleteTracking(true);
-
-												this.Meadow.doUpdate(tmpUpdateQuery,
-													(pUpdateError) =>
+												this.Meadow.doDelete(tmpDeleteQuery,
+													(pDeleteError) =>
 													{
-														if (pUpdateError)
+														if (pDeleteError)
 														{
-															this.log.error(`Error marking record as deleted ${this.EntitySchema.TableName} ID ${tmpRecordID}: ${pUpdateError}`);
+															this.log.error(`Error stamping delete audit columns ${this.EntitySchema.TableName} ID ${tmpRecordID}: ${pDeleteError}`);
 														}
-														return fRecordComplete();
+
+														const tmpRecordToCommit = this.marshalRecord(pEntityRecord);
+
+														const tmpUpdateQuery = this.Meadow.query.addRecord(tmpRecordToCommit);
+														tmpUpdateQuery.setDisableAutoIdentity(true);
+														tmpUpdateQuery.setDisableAutoDateStamp(true);
+														tmpUpdateQuery.setDisableAutoUserStamp(true);
+														tmpUpdateQuery.setDisableDeleteTracking(true);
+
+														this.Meadow.doUpdate(tmpUpdateQuery,
+															(pUpdateError) =>
+															{
+																if (pUpdateError)
+																{
+																	this.log.error(`Error marking record as deleted ${this.EntitySchema.TableName} ID ${tmpRecordID}: ${pUpdateError}`);
+																}
+																return fRecordComplete();
+															});
 													});
 											});
 									},

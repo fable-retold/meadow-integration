@@ -118,7 +118,7 @@ function makeBookRecord(pID, pTitle, pGenre, pDeleted)
 		UpdatingIDUser: 1,
 		Deleted: pDeleted ? 1 : 0,
 		DeleteDate: pDeleted ? '2025-07-01T00:00:00.000Z' : '',
-		DeletingIDUser: pDeleted ? 1 : 0,
+		DeletingIDUser: pDeleted ? 42 : 0,
 		Title: pTitle,
 		Type: 'Fiction',
 		Genre: pGenre,
@@ -688,6 +688,16 @@ suite
 																let tmpDeletedIDs = tmpDeletedAfterOngoing.map((r) => r.IDBook);
 																Expect(tmpDeletedIDs).to.include(3);
 																Expect(tmpDeletedIDs).to.include(5);
+
+																// The rows already existed locally as active, so this is
+																// the update branch -- the source's deleting user must
+																// still land in the clone rather than a 0 stamp.
+																tmpDeletedAfterOngoing.forEach(
+																	(pDeletedBook) =>
+																	{
+																		Expect(pDeletedBook.DeletingIDUser).to.equal(42,
+																			`Expected the source deleting user on ID ${pDeletedBook.IDBook}, got ${pDeletedBook.DeletingIDUser}`);
+																	});
 
 																return fDone();
 															});
